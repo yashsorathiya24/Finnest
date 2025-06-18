@@ -15,15 +15,39 @@ import io
 import os
 from werkzeug.utils import secure_filename
 from datetime import timezone
+import logging
+from logging.handlers import RotatingFileHandler
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 app = Flask(__name__)
-app.config.from_object(Config)
+app.config.from_object(Config())
 db.init_app(app)
+
+# Rate Limiter - More lenient settings for development
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["5000 per day", "1000 per hour"] if app.debug else ["200 per day", "50 per hour"]
+)
+
+# Logging Setup
+if not app.debug:
+    if not os.path.exists('logs'):
+        os.mkdir('logs')
+    file_handler = RotatingFileHandler('logs/app.log', maxBytes=10240, backupCount=10)
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'
+    ))
+    file_handler.setLevel(logging.INFO)
+    app.logger.addHandler(file_handler)
+    app.logger.setLevel(logging.INFO)
+    app.logger.info('Finnest startup')
 
 with app.app_context():
     db.create_all()
 
-# 🔹 Send OTP email
+# Helper Functions
 def send_otp_email(email, otp):
     msg = MIMEText(f"Your OTP for registration is: {otp}")
     msg['Subject'] = 'Your OTP Code'
@@ -35,54 +59,77 @@ def send_otp_email(email, otp):
             smtp.login(Config.EMAIL_USER, Config.EMAIL_PASS)
             smtp.send_message(msg)
     except Exception as e:
-        print("Failed to send email:", e)
+        app.logger.error(f"Failed to send email: {str(e)}")
 
-# 🔹 Email validation
 def is_valid_email(email):
     email_regex = r'^[\w\.-]+@[\w\.-]+\.\w+$'
     return re.match(email_regex, email) is not None
 
-# 🔹 JWT token generation
+def is_strong_password(password):
+    if len(password) < 8:
+        return False
+    if not re.search(r"[A-Z]", password):
+        return False
+    if not re.search(r"[a-z]", password):
+        return False
+    if not re.search(r"[0-9]", password):
+        return False
+    if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", password):
+        return False
+    return True
+
 def generate_token(user):
-    payload = {
-        'user_id': user.id,
-        'email': user.email,
-        'exp': datetime.now(timezone.utc) + timedelta(days=1)
-    }
-    token = pyjwt.encode(payload, Config.SECRET_KEY, algorithm='HS256')
+    try:
+        payload = {
+            'user_id': user.id,
+            'email': user.email,
+            'exp': datetime.now(timezone.utc) + timedelta(hours=Config.JWT_EXPIRATION_HOURS)
+        }
+        token = pyjwt.encode(payload, Config.SECRET_KEY, algorithm='HS256')
+        return token
+    except Exception as e:
+        app.logger.error(f"Token generation error: {str(e)}")
+        raise
 
-    # Ensure string output in Python 3.13+
-    if isinstance(token, bytes):
-        token = token.decode('utf-8')
-    return token
-
-# 🔹 JWT token required decorator
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         token = None
-        if 'Authorization' in request.headers:
-            token = request.headers['Authorization'].split(" ")[1]
-
-        if not token:
+        auth_header = request.headers.get('Authorization')
+        
+        if not auth_header:
             return jsonify({'message': 'Token is missing!'}), 401
+            
+        try:
+            token = auth_header.split(" ")[1]
+        except IndexError:
+            return jsonify({'message': 'Bearer token malformed!'}), 401
 
         try:
             data = pyjwt.decode(token, Config.SECRET_KEY, algorithms=['HS256'])
             current_user = User.query.get(data['user_id'])
+            if not current_user:
+                return jsonify({'message': 'User not found!'}), 401
         except pyjwt.ExpiredSignatureError:
             return jsonify({'message': 'Token has expired!'}), 401
-        except pyjwt.InvalidTokenError:
+        except pyjwt.InvalidTokenError as e:
+            app.logger.error(f"Invalid token error: {str(e)}")
             return jsonify({'message': 'Invalid token!'}), 401
+        except Exception as e:
+            app.logger.error(f"Token validation error: {str(e)}")
+            return jsonify({'message': 'Token validation failed!'}), 401
 
         return f(current_user, *args, **kwargs)
-
     return decorated
 
-# 🔹 1. Request OTP
+# Routes
 @app.route('/request-otp', methods=['POST'])
+@limiter.limit("10 per minute")  # Increased from 5 to 10
 def request_otp():
-    data = request.json
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No JSON data provided"}), 400
+        
     email = data.get('email')
 
     if not email:
@@ -99,14 +146,21 @@ def request_otp():
     else:
         db.session.add(OTPRequest(email=email, otp=otp, verified=False))
 
-    db.session.commit()
-    send_otp_email(email, otp)
-    return jsonify({"message": "OTP sent to your email"}), 200
+    try:
+        db.session.commit()
+        send_otp_email(email, otp)
+        return jsonify({"message": "OTP sent to your email"}), 200
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Database error: {str(e)}")
+        return jsonify({"error": "Failed to process request"}), 500
 
-# 🔹 2. Verify OTP
 @app.route('/verify-otp', methods=['POST'])
 def verify_otp():
-    data = request.json
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No JSON data provided"}), 400
+        
     email = data.get('email')
     otp = data.get('otp')
 
@@ -116,22 +170,29 @@ def verify_otp():
     record = OTPRequest.query.filter_by(email=email).first()
     if not record or record.otp != otp:
         return jsonify({"error": "Invalid OTP"}), 400
-    if datetime.utcnow() - record.created_at > timedelta(minutes=10):
+    if datetime.utcnow() - record.created_at > timedelta(minutes=Config.OTP_EXPIRATION_MINUTES):
         return jsonify({"error": "OTP expired"}), 400
 
     record.verified = True
     db.session.commit()
     return jsonify({"message": "OTP verified successfully"}), 200
 
-# 🔹 3. Set Password (Registration)
 @app.route('/set-password', methods=['POST'])
 def set_password():
-    data = request.json
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No JSON data provided"}), 400
+        
     email = data.get('email')
     password = data.get('password')
 
     if not email or not password:
         return jsonify({"error": "Email and Password are required"}), 400
+
+    if not is_strong_password(password):
+        return jsonify({
+            "error": "Password must be 8+ chars with uppercase, lowercase, number and special character"
+        }), 400
 
     otp = OTPRequest.query.filter_by(email=email).first()
     if not otp or not otp.verified:
@@ -146,65 +207,101 @@ def set_password():
     db.session.commit()
     return jsonify({"message": "User registered successfully"}), 201
 
-# 🔹 4. Login
 @app.route('/login', methods=['POST'])
 def login():
-    data = request.json
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No JSON data provided"}), 400
+        
     email = data.get('email')
     password = data.get('password')
 
-    # 1. Check both missing
-    if not email and not password:
+    if not email or not password:
         return jsonify({"error": "Email and password are required"}), 400
 
-    # 2. Check email missing
-    if not email:
-        return jsonify({"error": "Email is required"}), 400
-
-    # 3. Check password missing
-    if not password:
-        return jsonify({"error": "Password is required"}), 400
-
-    # 4. Check if user exists
     user = User.query.filter_by(email=email).first()
     if not user:
-        return jsonify({"error": "Invalid email"}), 401
+        return jsonify({"error": "Invalid credentials"}), 401  # Generic message for security
 
-    # 5. Check password
+    if user.locked_until and user.locked_until > datetime.utcnow():
+        remaining_time = (user.locked_until - datetime.utcnow()).seconds // 60
+        return jsonify({
+            "error": f"Account locked. Try again in {remaining_time} minutes"
+        }), 403
+
     if not sha256_crypt.verify(password, user.password):
-        return jsonify({"error": "Invalid password"}), 401
+        user.login_attempts += 1
+        if user.login_attempts >= Config.MAX_LOGIN_ATTEMPTS:
+            user.locked_until = datetime.utcnow() + timedelta(minutes=Config.ACCOUNT_LOCK_TIME)
+            db.session.commit()
+            return jsonify({
+                "error": "Account locked due to too many failed attempts"
+            }), 403
+        
+        db.session.commit()
+        return jsonify({
+            "error": "Invalid credentials"
+        }), 401  # Generic message for security
 
-    # 6. Generate token and return success response
-    token = generate_token(user)
-    return jsonify({
-        "message": "Login successful",
-        "token": token,
-        "user": {
-            "id": user.id,
-            "email": user.email
-        }
-    }), 200
+    user.login_attempts = 0
+    user.locked_until = None  # Clear any previous lock
+    user.last_login = datetime.utcnow()
+    db.session.commit()
+    
+    try:
+        token = generate_token(user)
+        return jsonify({
+            "message": "Login successful",
+            "token": token,
+            "user": {
+                "id": user.id,
+                "email": user.email
+            }
+        }), 200
+    except Exception as e:
+        app.logger.error(f"Token generation failed: {str(e)}")
+        return jsonify({"error": "Login failed"}), 500
 
-# 🔹 5. Protected route
 @app.route('/profile', methods=['GET'])
 @token_required
 def profile(current_user):
     return jsonify({
         "id": current_user.id,
-        "email": current_user.email
+        "email": current_user.email,
+        "last_login": current_user.last_login.isoformat() if current_user.last_login else None
     })
 
-# 🔹 6. Upload pdf 
 @app.route('/upload-pdf', methods=['POST'])
 @token_required
+@limiter.limit("20 per hour")  # Increased from 10 to 20
 def upload_pdf(current_user):
     if 'pdf' not in request.files:
         return jsonify({"error": "No PDF file provided"}), 400
-
+    
     pdf_file = request.files['pdf']
     password = request.form.get('password')
-
+    
+    if not pdf_file or pdf_file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+    
+    if not pdf_file.filename.lower().endswith('.pdf'):
+        return jsonify({"error": "Only PDF files are allowed"}), 400
+    
     try:
+        pdf_file.seek(0, os.SEEK_END)
+        file_size = pdf_file.tell()
+        pdf_file.seek(0)
+        
+        if file_size > Config.MAX_PDF_SIZE:
+            return jsonify({
+                "error": f"PDF too large. Max size is {Config.MAX_PDF_SIZE//(1024*1024)}MB"
+            }), 400
+        
+        magic_number = pdf_file.read(4)
+        pdf_file.seek(0)
+        if magic_number not in Config.ALLOWED_PDF_MAGIC_NUMBERS:
+            return jsonify({"error": "Invalid PDF file"}), 400
+
         pdf_content = io.BytesIO(pdf_file.read())
         pdf_reader = PyPDF2.PdfReader(pdf_content)
 
@@ -214,22 +311,13 @@ def upload_pdf(current_user):
             if not pdf_reader.decrypt(password):
                 return jsonify({"error": "Incorrect PDF password"}), 400
 
-        # Extract and normalize text
         full_text = "\n".join([page.extract_text() or "" for page in pdf_reader.pages])
-        print("======= PDF TEXT START =======")
-        print(full_text[:3000])
-        print("======= PDF TEXT END =======")
-
-        # Make it easier for regex to work
         normalized_text = re.sub(r'\s+', ' ', full_text)
-
-        # Extract blocks for each mutual fund (Edelweiss, Invesco, etc.)
         fund_blocks = re.split(r'(?=[A-Z][A-Za-z ]+? Mutual Fund)', normalized_text)
 
         policies = []
         for block in fund_blocks:
             try:
-
                 if 'Total Cost Value' not in block:
                     continue
 
@@ -266,8 +354,8 @@ def upload_pdf(current_user):
                 })
 
             except Exception as inner_e:
-                print("Block parsing failed:", inner_e)
-                continue  # skip bad blocks
+                app.logger.error(f"Block parsing failed: {str(inner_e)}")
+                continue
 
         if not policies:
             return jsonify({
@@ -284,6 +372,7 @@ def upload_pdf(current_user):
     except PyPDF2.errors.PdfReadError as e:
         return jsonify({"error": f"PDF Read Error: {str(e)}"}), 400
     except Exception as e:
+        app.logger.error(f"PDF processing error: {str(e)}")
         return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
 
 if __name__ == '__main__':

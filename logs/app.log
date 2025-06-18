@@ -1,0 +1,4 @@
+2025-06-18 11:02:34,811 INFO: Finnest startup [in /Users/yashsorathiya/Desktop/Finnest Development/Finnest/app.py:45]
+2025-06-18 11:02:45,959 INFO: Finnest startup [in /Users/yashsorathiya/Desktop/Finnest Development/Finnest/app.py:45]
+2025-06-18 11:02:46,159 INFO: Finnest startup [in /Users/yashsorathiya/Desktop/Finnest Development/Finnest/app.py:45]
+2025-06-18 11:03:11,101 ERROR: Invalid token error: Invalid payload padding [in /Users/yashsorathiya/Desktop/Finnest Development/Finnest/app.py:116]
